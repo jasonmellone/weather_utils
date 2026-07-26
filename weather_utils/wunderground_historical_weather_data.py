@@ -48,14 +48,30 @@ class HistoricalWeatherData:
         return str(val).zfill(2)
 
     def get_loaded_dates(self) -> None:
-        """Populate pre_existing_dates with dates already in the DB."""
+        """Populate pre_existing_dates with dates already in the DB.
+
+        Stores ``dt`` values as strings (``YYYYMMDD``) so they compare
+        directly against the keys built in :meth:`backfill`.
+        """
         sql = f'select distinct dt from talea."{self.table}"'
         out: pd.DataFrame = pd.read_sql(sql=sql, con=self.db.engine)
-        self.pre_existing_dates = [v[0] for v in out]
+        # Iterating a DataFrame yields column names, not rows -- select the
+        # column explicitly.
+        self.pre_existing_dates = [str(value) for value in out["dt"]]
 
-    def pull_date_and_insert(self, dt: str) -> None:
+    def pull_date_and_insert(self, dt: str, skip_if_loaded: bool = True) -> None:
+        """Pull one date and insert it, skipping dates already present.
+
+        Args:
+            dt: Date key in ``YYYYMMDD`` form.
+            skip_if_loaded: When True, do nothing if ``dt`` is already in
+                ``pre_existing_dates``. Call :meth:`get_loaded_dates` first.
+        """
+        if skip_if_loaded and str(dt) in self.pre_existing_dates:
+            return
         df = self.pull_historical_weather_underground_data(dt=dt)
         self._insert(df=df)
+        self.pre_existing_dates.append(str(dt))
 
     # Columns the API returns as object/None that the DB expects as numeric
     _FLOAT_COLS = {
@@ -207,17 +223,44 @@ class HistoricalWeatherData:
         df["station"] = url.split("/")[5]
         return df
 
-    def backfill(self, start: str, end: str) -> None:
-        """Backfill historical data for the hardcoded date range."""
+    def backfill(self, start: str, end: str, force: bool = False) -> None:
+        """Backfill historical data over a date range, skipping loaded dates.
+
+        Refreshes the loaded-date list first, then inserts only dates that are
+        missing. Without this guard every run appends another full copy of the
+        range, which is how the table accumulated up to 20 duplicates per day.
+
+        Args:
+            start: First date, ``YYYYMMDD``.
+            end: Last date, ``YYYYMMDD``.
+            force: Re-pull and insert even if the date is already present.
+                Only useful for repairing a known-bad date, and it will
+                duplicate rows unless the old ones are deleted first.
+        """
+        if not force:
+            self.get_loaded_dates()
+
+        inserted = skipped = failed = 0
         for ts in sorted(pd.date_range(start=start, end=end), reverse=True):
             dt = str(int(ts.strftime("%Y%m%d")))
-            print(dt)
+            if not force and dt in self.pre_existing_dates:
+                skipped += 1
+                continue
             try:
                 df = self.pull_historical_weather_underground_data(dt=dt)
                 self._insert(df)
-            except Exception as e:
+                self.pre_existing_dates.append(dt)
+                inserted += 1
+                print(f"{dt}: inserted")
+            except Exception as e:  # noqa: BLE001 - keep going through the range
+                failed += 1
                 print(f"Failing {dt}: {e}")
                 traceback.print_exc()
+
+        print(
+            f"backfill complete: {inserted} inserted, "
+            f"{skipped} already present, {failed} failed"
+        )
 
 
 if __name__ == "__main__":
