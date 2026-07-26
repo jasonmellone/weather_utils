@@ -1,10 +1,10 @@
+import functools
 import time
+import traceback
 import typing
 
-import mellone_utilities.postgres as pg
 import pandas as pd
 import requests
-import functools
 
 API = "e1f10a1e78da46f5b10a1e78da96f525"
 
@@ -20,8 +20,14 @@ class WeatherForecast:
 
 
 class HistoricalWeatherData:
-    def __init__(self, connect: bool = True) -> None:
-        self.db: typing.Any = pg.db_connect()
+    def __init__(self, db: typing.Any, connect: bool = True) -> None:
+        """Initialize with a database connection provided by the caller.
+
+        Args:
+            db: Database wrapper with ``connect()`` and ``engine`` attributes.
+            connect: Whether to call ``db.connect()`` during initialization.
+        """
+        self.db = db
         if connect:
             self.db.connect()
         self.table: str = "WundergroundHistorical"
@@ -51,7 +57,22 @@ class HistoricalWeatherData:
         df = self.pull_historical_weather_underground_data(dt=dt)
         self._insert(df=df)
 
+    # Columns the API returns as object/None that the DB expects as numeric
+    _FLOAT_COLS = {
+        "precip_total",
+        "precip_hrly",
+        "gust",
+        "max_temp",
+        "min_temp",
+        "pressure",
+        "pressure_tend",
+        "wdir",
+    }
+
     def _insert(self, df: pd.DataFrame) -> None:
+        for col in self._FLOAT_COLS:
+            if col in df.columns and df[col].dtype == object:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
         df.to_sql(
             name=self.table,
             con=self.db.engine,
@@ -77,7 +98,9 @@ class HistoricalWeatherData:
         data.raise_for_status()
         return data.json()
 
-    def construct_url_from_lat_lng(self, lat: float, lng: float) -> str:
+    def construct_url_from_lat_lng(
+        self, lat: float, lng: float, exclude_station_ids: list
+    ) -> str:
         """construct_url_from_lat_lng _summary_
 
         Args:
@@ -95,10 +118,19 @@ class HistoricalWeatherData:
             raise NotImplementedError
 
         # Pick the closest station with a standard 4-letter ICAO code
-        index = next(
-            (i for i, sid in enumerate(loc["stationId"]) if len(sid) == 4 and sid.isalpha()),
-            None,
-        )
+        for i, sid in enumerate(loc["stationId"]):
+            if len(sid) == 4 and sid.isalpha() and sid not in exclude_station_ids:
+                index = i
+                break
+
+        # index = next(
+        #     (
+        #         i
+        #         for i, sid in enumerate(loc["stationId"])
+
+        #     ),
+        #     None,
+        # )
         if index is None:
             raise ValueError("No ICAO station found near the given coordinates")
 
@@ -132,14 +164,33 @@ class HistoricalWeatherData:
                 f"https://api.weather.com/v1/location/KLGA:9:US/observations/historical.json"
                 f"?apiKey=e1f10a1e78da46f5b10a1e78da96f525&units=e&startDate={dt}"
             )
+            res = requests.get(
+                url
+                # f"https://api.weather.com/v1/location/KLGA:9:US/observations/historical.json"
+                # f"?apiKey=e1f10a1e78da46f5b10a1e78da96f525&units=e&startDate={dt}"
+            )
         else:
-            url = self.construct_url_from_lat_lng(lat=lat, lng=lng).format(dt=dt)
-        res = requests.get(
-            url
-            # f"https://api.weather.com/v1/location/KLGA:9:US/observations/historical.json"
-            # f"?apiKey=e1f10a1e78da46f5b10a1e78da96f525&units=e&startDate={dt}"
-        )
+            exclude_station_ids = []
+            flag = True
+            i = 0
+            while flag:
+                url = self.construct_url_from_lat_lng(
+                    lat=lat, lng=lng, exclude_station_ids=exclude_station_ids
+                ).format(dt=dt)
+                res = requests.get(
+                    url
+                    # f"https://api.weather.com/v1/location/KLGA:9:US/observations/historical.json"
+                    # f"?apiKey=e1f10a1e78da46f5b10a1e78da96f525&units=e&startDate={dt}"
+                )
+                flag = res.status_code != 200
+                i += 1
+                if i > 20:
+                    raise Exception
+                # if flag:
+                #     x = 1
+                exclude_station_ids.append(url.split("/")[5].split(":")[0])
         data = res.json()
+
         df: pd.DataFrame = pd.DataFrame(data["observations"])
         df["valid_time_gmt_datetime"] = df.apply(
             self.create_datetime_from_column, axis=1
@@ -147,7 +198,13 @@ class HistoricalWeatherData:
         df["expire_time_gmt_datetime"] = df.apply(
             self.create_datetime_from_column, axis=1, args=("expire_time_gmt",)
         )
+        df["expire_time_est_datetime"] = (
+            df["expire_time_gmt_datetime"]
+            .dt.tz_localize("UTC")
+            .dt.tz_convert("US/Eastern")
+        ).dt.tz_localize(None)
         df["dt"] = dt
+        df["station"] = url.split("/")[5]
         return df
 
     def backfill(self, start: str, end: str) -> None:
@@ -158,10 +215,15 @@ class HistoricalWeatherData:
             try:
                 df = self.pull_historical_weather_underground_data(dt=dt)
                 self._insert(df)
-            except Exception:
-                print(f"Failing {dt}")
+            except Exception as e:
+                print(f"Failing {dt}: {e}")
+                traceback.print_exc()
 
 
 if __name__ == "__main__":
-    H = HistoricalWeatherData(connect=True)
-    H.pull_historical_weather_underground_data(lat=40.9259, lng=-73.8271,dt='20260403')
+    raise SystemExit(
+        "Pass a database connection when using HistoricalWeatherData, e.g.:\n"
+        "  from talea_db.postgres import db_connect\n"
+        "  db = db_connect()\n"
+        "  H = HistoricalWeatherData(db=db)"
+    )
